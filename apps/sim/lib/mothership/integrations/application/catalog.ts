@@ -38,6 +38,7 @@ export const readIntegrationCatalogOperation = defineWorkspaceOperation({
   minimumRole: 'read',
   workspaceApiKey: 'deny',
   capability: 'copilot.use',
+  contentDelivery: 'none',
   principalKinds: ['delegated'],
   delegatedServices: ['copilot', 'executor'],
 })
@@ -129,6 +130,7 @@ const catalogUseCase = defineAuthorizedChatUseCase({
   operation: readIntegrationCatalogOperation,
   organizationOperation: defineOrganizationOperation({
     id: readIntegrationCatalogOperation.id,
+    contentDelivery: 'none',
     minimumRole: 'member',
     capability: 'copilot.use',
     principalKinds: ['organization_delegated'],

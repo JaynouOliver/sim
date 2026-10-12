@@ -8,6 +8,7 @@ import {
 import { escapeRegExp } from '@sim/utils/string'
 import { eq } from 'drizzle-orm'
 import type { MothershipTableViewContext } from '@/lib/api/contracts/mothership-resources'
+import { observeContentDelivery } from '@/lib/core/application/content-delivery'
 import { getAllowedIntegrationsFromEnv } from '@/lib/core/config/env-flags'
 import { OrchestrationError } from '@/lib/core/orchestration/types'
 import { mapWithConcurrency } from '@/lib/core/utils/concurrency'
@@ -50,6 +51,7 @@ import {
   safeBrowserSelectionUrl,
   truncateSelectionText,
 } from '@/lib/mothership/chat/selection-context'
+import { createRegistryContentGate } from '@/lib/mothership/content-delivery/registry-gate'
 import { QueryLogs } from '@/lib/mothership/generated/tool-catalog-v1'
 import { canonicalWorkspaceFilePath } from '@/lib/mothership/vfs/path-utils'
 import { isBlockTypeAccessControlExempt } from '@/lib/permission-groups/block-access'
@@ -70,7 +72,8 @@ import { readWorkflowMetadata } from '@/lib/workflows/application/read-workflow'
 import { getBuiltinSkillById } from '@/lib/workflows/skills/builtin-skills'
 import { readWorkspaceFileMetadata } from '@/lib/workspace-files/application/read-workspace-file-metadata'
 import { getBlockRegistry } from '@/blocks/registry'
-import type { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
+import { projectResolvedSecretModelContent } from '@/executor/utils/resolved-secret-content-projection'
+import { ResolvedSecretTraceRegistry } from '@/executor/utils/resolved-secret-trace-registry'
 import type { BrowserTextSelection, ChatContext, TerminalTextSelection } from '@/stores/panel'
 
 type AgentContextType =
@@ -345,7 +348,8 @@ export async function processContextsServer(
         ctx.columnIds,
         ctx.label,
         userId,
-        chatId
+        chatId,
+        resolvedSecretTraceRegistry
       )
     }
     if ((ctx.kind === 'folder' || ctx.kind === 'filefolder') && workspaceId) {
@@ -1141,7 +1145,8 @@ async function resolveTableSelectionResource(
   columnIds: string[] | undefined,
   label: string,
   userId: string,
-  chatId?: string
+  chatId?: string,
+  turnRegistry?: ResolvedSecretTraceRegistry
 ): Promise<AgentContext | null> {
   if (
     rowIds.length > MAX_TABLE_SELECTION_ROWS ||
@@ -1168,17 +1173,31 @@ async function resolveTableSelectionResource(
   if (columns.length === 0) return null
 
   const uniqueRowIds = [...new Set(rowIds)]
-  const result = await queryTableRows.execute({
-    principal,
-    input: {
-      tableId,
-      assertedWorkspaceId: workspaceId,
-      predicate: { all: [{ field: 'id', op: 'in', value: uniqueRowIds }] },
-      legacyKeying: 'ids',
-      columns: columns.map(getColumnId),
-      limit: uniqueRowIds.length,
-      includeTotal: true,
-    },
+  /**
+   * The preview is inlined into the turn as text no later projection reads, so it is redacted
+   * here: each row is admitted on its own against a selection-local registry, which then redacts
+   * the preview and hands its secrets to the turn's registry for everything after.
+   */
+  const selectionRegistry = new ResolvedSecretTraceRegistry([], { userId, workspaceId })
+  const result = await observeContentDelivery(
+    createRegistryContentGate({ registry: selectionRegistry, workspaceId, actorUserId: userId }),
+    () =>
+      queryTableRows.execute({
+        principal,
+        input: {
+          tableId,
+          assertedWorkspaceId: workspaceId,
+          predicate: { all: [{ field: 'id', op: 'in', value: uniqueRowIds }] },
+          legacyKeying: 'ids',
+          columns: columns.map(getColumnId),
+          limit: uniqueRowIds.length,
+          includeTotal: true,
+        },
+      })
+  )
+  await turnRegistry?.importProvenance(selectionRegistry.exportProvenance(), {
+    trusted: true,
+    origin: 'chatContext.tableSelection',
   })
   const rowsById = new Map(result.rows.map((row) => [row.id, row]))
   const rows = uniqueRowIds.flatMap((id) => {
@@ -1229,10 +1248,18 @@ async function resolveTableSelectionResource(
   }
 
   const rendered = `${describe(sizeClause(lines.length, selectedRowCount - lines.length))}${lines.join('\n')}`
+  const projected = projectResolvedSecretModelContent(rendered, selectionRegistry)
+  const withheldRows = uniqueRowIds.length - rows.length
+  const withheldNote =
+    withheldRows > 0
+      ? `\n\n${withheldRows} selected ${withheldRows === 1 ? 'row is' : 'rows are'} not shown: ${withheldRows === 1 ? 'its' : 'their'} secret provenance could not be verified.`
+      : ''
   const preview =
-    rendered.length <= MAX_TABLE_SELECTION_PREVIEW_LENGTH
-      ? rendered
-      : `Selected ${scope} from table "${table.name}" (${selectedRowCount} rows, ${columns.length} columns). The column headings exceed the selection content limit; no cell values were inlined.`
+    !projected.safe || typeof projected.value !== 'string'
+      ? `Selected ${scope} from table "${table.name}" (${selectedRowCount} rows, ${columns.length} columns). Cell values could not be checked for secret values, so none were inlined.`
+      : projected.value.length <= MAX_TABLE_SELECTION_PREVIEW_LENGTH
+        ? `${projected.value}${withheldNote}`
+        : `Selected ${scope} from table "${table.name}" (${selectedRowCount} rows, ${columns.length} columns). The column headings exceed the selection content limit; no cell values were inlined.`
   const content = `${selection}\n\n${preview}`
   return {
     type: 'table_selection',
