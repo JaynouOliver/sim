@@ -14,6 +14,8 @@ const MAX_CHECKPOINT_BYTES = 4 * 1024 * 1024
 const KEY_PATTERN = /^knowledge-vision-checkpoints\/v1\/[a-f0-9]{64}\.json$/
 
 const visionUsageSchema = z.object({
+  /** One extraction's paid calls; a resumed pass replays it, so the charge records once. */
+  chargeId: z.string().min(1),
   model: z.string().min(1),
   cost: z.number().finite().nonnegative(),
   inputTokens: z.number().int().nonnegative(),

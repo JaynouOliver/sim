@@ -1,7 +1,8 @@
 /**
  * Real sync workers, PostgreSQL, file storage, indexing and reconciliation for Confluence image
  * attachments. The source listing is a synthetic connector behind the real Confluence meta, and
- * the vision extraction and embeddings are synthetic, so no request leaves the process.
+ * the vision extraction and embeddings are synthetic, so no request leaves the process. A
+ * `cutOff` image runs the real extractor against a Gemini reply stopped at its token limit.
  */
 import { mkdtempSync } from 'node:fs'
 import { rm } from 'node:fs/promises'
@@ -13,6 +14,7 @@ import {
   embedding,
   knowledgeConnector,
   organization,
+  usageLog,
   user,
   workspace,
 } from '@sim/db/schema'
@@ -27,6 +29,9 @@ const fixture = vi.hoisted(() => {
     /** externalId to version; a version bump changes the image's bytes and hash. */
     images: new Map<string, number>(),
     decorative: new Set<string>(),
+    cutOff: new Set<string>(),
+    /** Text documents listed beside the images, whatever the image setting. */
+    pages: new Set<string>(),
     extractions: [] as string[],
     /** Each chunk gets its own one-hot vector, so the shared HNSW graph sees no duplicates. */
     nextVector: 0,
@@ -53,22 +58,56 @@ vi.mock('@/lib/embeddings', async () => ({
     pricingId: 'text-embedding-3-small',
   }),
 }))
-vi.mock('@/lib/knowledge/documents/image-extraction', async (importOriginal) => ({
-  ...(await importOriginal<typeof import('@/lib/knowledge/documents/image-extraction')>()),
-  extractImageText: async ({ filename }: { filename: string }) => {
-    fixture.extractions.push(filename)
-    const externalId = filename.replace(/\.png$/, '')
-    if (fixture.decorative.has(externalId)) return { decorative: true, renderedText: '' }
-    return {
-      decorative: false,
-      renderedText: `${externalId} version ${fixture.images.get(externalId)}: Region EMEA launches in Q1.`,
-      usage: { model: 'gemini-3.8-flash', cost: 0, inputTokens: 10, outputTokens: 10 },
-    }
-  },
+vi.mock('@/lib/knowledge/documents/image-extraction-gemini', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('@/lib/knowledge/documents/image-extraction-gemini')>()),
+  requestGeminiImageExtraction: async () => ({
+    text: '{"kind": "table", "rendered_text": "Region: EMEA',
+    finishReason: 'MAX_TOKENS',
+    inputTokens: 1200,
+    outputTokens: 32_768,
+  }),
 }))
+vi.mock('@/lib/knowledge/documents/image-extraction', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/lib/knowledge/documents/image-extraction')>()
+  return {
+    ...actual,
+    extractImageText: async (input: Parameters<typeof actual.extractImageText>[0]) => {
+      const externalId = input.filename.replace(/\.png$/, '')
+      if (fixture.cutOff.has(externalId)) return actual.extractImageText(input)
+      fixture.extractions.push(input.filename)
+      if (fixture.decorative.has(externalId)) return { decorative: true, renderedText: '' }
+      return {
+        decorative: false,
+        renderedText: `${externalId} version ${fixture.images.get(externalId)}: Region EMEA launches in Q1.`,
+      }
+    },
+  }
+})
 vi.mock('@/connectors/registry.server', async () => {
   const { confluenceConnectorMeta } = await import('@/connectors/confluence/meta')
   const enabled = (config: Record<string, unknown>) => config.imageAttachments === 'semantic'
+  const page = (externalId: string) => ({
+    externalId,
+    title: externalId,
+    content: `${externalId}: the EMEA launch plan covers regional owners, launch dates, and the field marketing calendar for the first quarter of 2026.`,
+    mimeType: 'text/plain',
+    contentHash: `fixture-page:${externalId}`,
+  })
+  /** A real, noisy PNG over the semantic byte floor, so the real extractor reads it. */
+  const cutOffImage = async () => {
+    const sharp = (await import('sharp')).default
+    return sharp({
+      create: {
+        width: 256,
+        height: 256,
+        channels: 3,
+        background: '#808080',
+        noise: { type: 'gaussian', mean: 128, sigma: 60 },
+      },
+    })
+      .png()
+      .toBuffer()
+  }
   const stub = (externalId: string) => {
     const version = fixture.images.get(externalId) ?? 1
     return {
@@ -86,7 +125,10 @@ vi.mock('@/connectors/registry.server', async () => {
         ...confluenceConnectorMeta,
         validateConfig: async () => ({ valid: true }),
         listDocuments: async (_token: string, config: Record<string, unknown>) => ({
-          documents: enabled(config) ? [...fixture.images.keys()].map(stub) : [],
+          documents: [
+            ...(enabled(config) ? [...fixture.images.keys()].map(stub) : []),
+            ...[...fixture.pages].map(page),
+          ],
           hasMore: false,
         }),
         getDocument: async (
@@ -94,8 +136,11 @@ vi.mock('@/connectors/registry.server', async () => {
           _config: Record<string, unknown>,
           externalId: string
         ) => {
+          if (fixture.pages.has(externalId)) return page(externalId)
           if (!fixture.images.has(externalId)) return null
-          const bytes = Buffer.from(`fixture png ${externalId} v${fixture.images.get(externalId)}`)
+          const bytes = fixture.cutOff.has(externalId)
+            ? await cutOffImage()
+            : Buffer.from(`fixture png ${externalId} v${fixture.images.get(externalId)}`)
           return {
             ...stub(externalId),
             contentDeferred: false,
@@ -116,13 +161,20 @@ import {
 import {
   createKnowledgeConnector,
   updateKnowledgeConnector,
+  updateKnowledgeConnectorDocuments,
 } from '@/lib/knowledge/application/connectors'
 import * as connectorTokens from '@/lib/knowledge/connectors/access-token'
 import { executeSync } from '@/lib/knowledge/connectors/sync-engine'
 import { IMAGES_DEFERRED_NOTICE } from '@/lib/knowledge/connectors/sync-limits'
+import { resolveImageExtractionModel } from '@/lib/knowledge/documents/image-extraction-gemini'
 
 describe('Confluence image attachments through sync, indexing and reconciliation', () => {
   const ids = createKnowledgeAclFixtureIds()
+  const principal = {
+    kind: 'session',
+    userId: ids.aliceId,
+    sessionId: 'confluence-images',
+  } as const
   let billing: Awaited<ReturnType<typeof resolveBillingAttribution>>
   const priorGeminiKeys = {
     GEMINI_API_KEY: env.GEMINI_API_KEY,
@@ -169,7 +221,7 @@ describe('Confluence image attachments through sync, indexing and reconciliation
   /** Changes the setting the way a user does; the update dispatches the next sync, which runs in-process. */
   async function setImageAttachments(imageAttachments: 'semantic' | 'off') {
     await updateKnowledgeConnector.execute({
-      principal: { kind: 'session', userId: ids.aliceId, sessionId: 'confluence-images' },
+      principal,
       input: {
         connectorId: ids.connectorId,
         updates: {
@@ -232,6 +284,8 @@ describe('Confluence image attachments through sync, indexing and reconciliation
     Object.assign(env, { GEMINI_API_KEY: 'fixture-gemini-key' })
     fixture.extractions.length = 0
     fixture.decorative.clear()
+    fixture.cutOff.clear()
+    fixture.pages.clear()
     fixture.images.clear()
     await db.delete(document).where(eq(document.connectorId, ids.connectorId))
     await configure('semantic')
@@ -306,6 +360,73 @@ describe('Confluence image attachments through sync, indexing and reconciliation
     expect(fixture.extractions.sort()).toEqual(['image-a.png', 'image-b.png'])
   }, 120_000)
 
+  it('keeps an excluded image out of search when it is restored while Image Attachments is off', async () => {
+    fixture.images.set('image-a', 1)
+    fixture.pages.add('page-a')
+    await sync()
+    const indexed = await images()
+    const image = indexed.find((row) => row.externalId === 'image-a')
+    const textPage = indexed.find((row) => row.externalId === 'page-a')
+    if (!image || !textPage) throw new Error('Expected the image and the page to be indexed')
+    const documentIds = [image.id, textPage.id]
+    await updateKnowledgeConnectorDocuments.execute({
+      principal,
+      input: { connectorId: ids.connectorId, operation: 'exclude', documentIds },
+    })
+
+    await setImageAttachments('off')
+    /** The exclusion is a tombstone the removal pass keeps, vectors included. */
+    expect(await vectors([image.id])).toHaveLength(1)
+
+    const restored = await updateKnowledgeConnectorDocuments.execute({
+      principal,
+      input: { connectorId: ids.connectorId, operation: 'restore', documentIds },
+    })
+    expect(restored.documentIds).toEqual([textPage.id])
+    await expect(
+      updateKnowledgeConnectorDocuments.execute({
+        principal,
+        input: { connectorId: ids.connectorId, operation: 'restore', documentIds: [image.id] },
+      })
+    ).rejects.toMatchObject({ code: 'validation' })
+    expect(
+      (await images()).map(({ externalId, userExcluded, enabled }) => ({
+        externalId,
+        userExcluded,
+        enabled,
+      }))
+    ).toEqual([
+      { externalId: 'image-a', userExcluded: true, enabled: false },
+      { externalId: 'page-a', userExcluded: false, enabled: true },
+    ])
+  }, 120_000)
+
+  it('bills the Gemini call once when a reply cut off at its token limit fails the image', async () => {
+    fixture.images.set('image-a', 1)
+    fixture.cutOff.add('image-a')
+    await executeSync(ids.connectorId, { fullSync: true, billingAttribution: billing })
+
+    await expect
+      .poll(async () => (await images()).map((row) => row.processingStatus), { timeout: 45_000 })
+      .toEqual(['failed'])
+    const [failed] = await images()
+    expect(failed.processingError).toContain('more text than one extraction can return')
+    expect(await vectors([failed.id])).toEqual([])
+    const charges = await db
+      .select()
+      .from(usageLog)
+      .where(
+        and(
+          eq(usageLog.workspaceId, ids.workspaceId),
+          eq(usageLog.source, 'knowledge-base'),
+          eq(usageLog.description, resolveImageExtractionModel())
+        )
+      )
+    expect(charges).toHaveLength(1)
+    expect(Number(charges[0].cost)).toBeGreaterThan(0)
+    expect(charges[0].metadata).toEqual({ inputTokens: 1200, outputTokens: 32_768 })
+  }, 120_000)
+
   it('keeps images off for a connector created before the setting existed', async () => {
     fixture.images.set('image-a', 1)
     await configure(undefined)
@@ -349,7 +470,7 @@ describe('Confluence image attachments through sync, indexing and reconciliation
     'saves a new connector with Image Attachments on unless the request chose otherwise (%o)',
     async (chosen, saved) => {
       const created = await createKnowledgeConnector.execute({
-        principal: { kind: 'session', userId: ids.aliceId, sessionId: 'confluence-images' },
+        principal,
         input: {
           knowledgeBaseId: ids.knowledgeBaseId,
           connectorType: 'confluence',

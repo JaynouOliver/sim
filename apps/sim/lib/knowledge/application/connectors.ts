@@ -10,8 +10,9 @@ import {
   knowledgeConnectorSyncLog,
 } from '@sim/db/schema'
 import { toError } from '@sim/utils/errors'
+import { toRecord } from '@sim/utils/object'
 import { escapeLikePattern } from '@sim/utils/string'
-import { and, asc, desc, eq, inArray, isNull, lt, or, sql } from 'drizzle-orm'
+import { and, asc, desc, eq, inArray, isNull, lt, notInArray, or, sql } from 'drizzle-orm'
 import type { ConnectorDocumentFilter } from '@/lib/api/contracts/knowledge/connectors'
 import type { BillingAttributionSnapshot } from '@/lib/billing/core/billing-attribution'
 import { requireCurrentHumanRole } from '@/lib/core/application'
@@ -83,6 +84,10 @@ import {
   MAX_KNOWLEDGE_CONNECTOR_DOCUMENT_PAGE_SIZE,
   MAX_KNOWLEDGE_CONNECTOR_DOCUMENT_SEARCH_LENGTH,
 } from '@/lib/knowledge/constants'
+import {
+  isImageExtractionEnabled,
+  SEMANTIC_IMAGE_MIME_TYPES,
+} from '@/lib/knowledge/documents/image-extraction-policy'
 import {
   documentProcessingOutcomeSelection,
   failedDocumentCondition,
@@ -1294,20 +1299,39 @@ export const updateKnowledgeConnectorDocuments = defineAuthorizedKnowledgeUseCas
     if (restoring && !requiresConnectorIndexing(context.knowledgeBase.isSearchIndex)) {
       throw new OrchestrationError('validation', 'This search index is inactive; use Sim Search.')
     }
+    const imageExtraction = getConnectorMeta(context.connector.connectorType)?.imageExtraction
+    /** An excluded image keeps its vectors, so restoring it while images are off would make it searchable again. */
+    const imagesOff =
+      restoring &&
+      imageExtraction !== undefined &&
+      !isImageExtractionEnabled(imageExtraction, toRecord(context.connector.sourceConfig))
+    const requested = and(
+      eq(document.connectorId, context.connectorId),
+      inArray(document.id, documentIds),
+      eq(document.userExcluded, restoring),
+      isNull(document.archivedAt),
+      isNull(document.deletedAt),
+      knowledgeAccessCondition(await context.access.get())
+    )
+    const semanticImages = [...SEMANTIC_IMAGE_MIME_TYPES]
     const updated = await db
       .update(document)
       .set({ userExcluded: !restoring, enabled: restoring })
-      .where(
-        and(
-          eq(document.connectorId, context.connectorId),
-          inArray(document.id, documentIds),
-          eq(document.userExcluded, restoring),
-          isNull(document.archivedAt),
-          isNull(document.deletedAt),
-          knowledgeAccessCondition(await context.access.get())
-        )
-      )
+      .where(imagesOff ? and(requested, notInArray(document.mimeType, semanticImages)) : requested)
       .returning({ id: document.id })
+    if (imagesOff && updated.length === 0) {
+      const [heldImage] = await db
+        .select({ id: document.id })
+        .from(document)
+        .where(and(requested, inArray(document.mimeType, semanticImages)))
+        .limit(1)
+      if (heldImage) {
+        throw new OrchestrationError(
+          'validation',
+          'Set Image Attachments to Read with AI to restore images.'
+        )
+      }
+    }
     return {
       operation: input.operation,
       count: updated.length,
